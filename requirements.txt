@@ -5,8 +5,6 @@ psycopg2-binary==2.9.9
 daphne==4.2.1
 redis==5.0.8
 autobahn==23.6.2
-djangorestframework
-django-rest-knox
-pillow
-olefile
-drf-yasg
+djangorestframework==3.15.2
+drf-yasg==1.21.7
+pillow==10.4.0

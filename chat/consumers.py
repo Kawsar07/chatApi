@@ -1,110 +1,288 @@
 import json
-import redis
+import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-from .models import Message, Profile
-from django.contrib.auth.models import User
-from knox.auth import TokenAuthentication
-from rest_framework.exceptions import AuthenticationFailed
+from django.conf import settings
+from django.db import models
+from datetime import datetime
 
-redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0)
+logger = logging.getLogger(__name__)
+
 
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        self.room_name = self.scope['url_route']['kwargs']['room_name']
-        self.room_group_name = f'chat_{self.room_name}'
-        
-        try:
-            token = self.scope['query_string'].decode().split('token=')[1]
-            token_auth = TokenAuthentication()
-            user, _ = await database_sync_to_async(token_auth.authenticate_credentials)(token.encode())
-            self.scope['user'] = user
-        except (IndexError, AuthenticationFailed):
-            await self.close()
+        # Extract token and friend_username from query string
+        query_string = self.scope.get('query_string', b'').decode()
+        params = dict(param.split('=') for param in query_string.split('&') if '=' in param)
+        token = params.get('token')
+        friend_username = params.get('friend_username')
+
+        logger.debug(f"WebSocket connect attempt: path={self.scope['path']}, query={query_string}")
+
+        if not token:
+            await self._reject("Authentication failed: No token provided", 4003)
             return
 
-        await database_sync_to_async(redis_client.set)(f'user:{user.username}:active', 1, ex=60)
-        
         try:
-            profile = await database_sync_to_async(Profile.objects.get)(user=user)
-            picture_url = profile.picture.url if profile.picture else ''
-            location = profile.location
-        except Profile.DoesNotExist:
-            picture_url = ''
-            location = ''
-        
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                'type': 'user_status',
-                'username': user.username,
-                'status': 'joined',
-                'picture': picture_url,
-                'location': location,
-            }
-        )
+            from django.contrib.auth import get_user_model
+            from rest_framework.authtoken.models import Token
 
-        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
-        await self.accept()
+            user = await self.get_user_from_token(token)
+            if not user or not user.is_authenticated:
+                logger.error(f"Invalid or unauthenticated user for token: {token}")
+                await self._reject("Authentication failed: Invalid or expired token", 4001)
+                return
 
-    async def disconnect(self, close_code):
-        if hasattr(self, 'scope') and 'user' in self.scope and self.scope['user'].is_authenticated:
-            user = self.scope['user']
-            await database_sync_to_async(redis_client.delete)(f'user:{user.username}:active')
+            self.user = user
+            self.room_group_name = 'chat_testroom'
+            self.friend_username = friend_username
+            logger.info(f"User authenticated: {user.username}, friend={friend_username}")
+
+            # Join room group
+            await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            await self.accept()
+            logger.info(f"WebSocket connection accepted for user: {user.username}")
+
+            # Get profile and image URL
+            from .models import Profile
+            profile = await self.get_profile(user)
+            image_url = (
+                f"{settings.WEBSOCKET_BASE_URL}{profile.picture.url}"
+                if profile and profile.picture else ''
+            )
+
+            # Broadcast join status
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
                     'type': 'user_status',
-                    'username': user.username,
-                    'status': 'left',
-                    'picture': '',
-                    'location': '',
+                    'status': 'joined',
+                    'user': user.username,
+                    'image_url': image_url,
                 }
             )
+
+            # Send connection confirmation
+            await self.send(text_data=json.dumps({
+                'type': 'status',
+                'status': 'connected',
+                'message': 'WebSocket connected successfully',
+                'user': user.username,
+                'image_url': image_url,
+            }))
+
+            # Send previous messages if friend_username is provided
+            if friend_username:
+                await self._send_previous_messages(friend_username)
+            else:
+                logger.debug("No friend_username provided; skipping previous messages")
+
+        except Exception as e:
+            logger.error(f"Connection error: {str(e)}", exc_info=True)
+            await self._reject(f"Connection error: {str(e)}", 4000)
+
+    async def disconnect(self, close_code):
+        logger.debug(f"WebSocket disconnect: user={getattr(self, 'user', None)}, code={close_code}")
+        if hasattr(self, 'user') and self.user.is_authenticated:
+            try:
+                from .models import Profile
+                profile = await self.get_profile(self.user)
+                image_url = (
+                    f"{settings.WEBSOCKET_BASE_URL}{profile.picture.url}"
+                    if profile and profile.picture else ''
+                )
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        'type': 'user_status',
+                        'status': 'left',
+                        'user': self.user.username,
+                        'image_url': image_url,
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Disconnect error: {str(e)}", exc_info=True)
+
         await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
     async def receive(self, text_data):
-        text_data_json = json.loads(text_data)
-        message = text_data_json['message']
-        user = self.scope['user'] if self.scope['user'].is_authenticated else None
-
-        if not user:
-            user = await database_sync_to_async(User.objects.get)(username='testuser')
-
+        logger.debug(f"Received data: {text_data}")
         try:
-            profile = await database_sync_to_async(Profile.objects.get)(user=user)
-            picture_url = profile.picture.url if profile.picture else ''
-        except Profile.DoesNotExist:
-            picture_url = ''
+            data = json.loads(text_data)
+            message = data.get('message')
+            receiver_username = data.get('receiver_username')
 
-        await self.save_message(user, message, self.room_name)
+            if not message or not receiver_username:
+                await self.send(text_data=json.dumps({
+                    'error': 'Invalid message: message and receiver_username are required',
+                    'code': 4004
+                }))
+                return
 
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                'type': 'chat_message',
-                'message': message,
-                'user': user.username,
-                'picture': picture_url,
-            }
-        )
+            # Update friend_username if not set
+            if not hasattr(self, 'friend_username') or not self.friend_username:
+                self.friend_username = receiver_username
+
+            # Verify receiver exists
+            receiver = await self.get_user(receiver_username)
+            if not receiver:
+                await self.send(text_data=json.dumps({
+                    'error': f'Receiver not found: {receiver_username}',
+                    'code': 4005
+                }))
+                return
+
+            # Save message
+            try:
+                message_obj = await self.create_message(self.user, receiver_username, message)
+            except Exception as e:
+                await self.send(text_data=json.dumps({
+                    'error': f'Failed to save message: {str(e)}',
+                    'code': 4006
+                }))
+                return
+
+            # Get sender's profile image
+            from .models import Profile
+            profile = await self.get_profile(self.user)
+            image_url = (
+                f"{settings.WEBSOCKET_BASE_URL}{profile.picture.url}"
+                if profile and profile.picture else ''
+            )
+
+            # Broadcast message
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    'type': 'chat_message',
+                    'message': message,
+                    'user': self.user.username,
+                    'timestamp': message_obj.timestamp.isoformat() + 'Z',
+                    'image_url': image_url,
+                }
+            )
+
+            # Send previous messages once
+            if not getattr(self, '_history_sent', False):
+                self._history_sent = True
+                await self._send_previous_messages(receiver_username)
+
+        except json.JSONDecodeError:
+            await self.send(text_data=json.dumps({
+                'error': 'Invalid JSON format',
+                'code': 4002
+            }))
+        except Exception as e:
+            logger.error(f"Receive error: {str(e)}", exc_info=True)
+            await self.send(text_data=json.dumps({
+                'error': f'Internal server error: {str(e)}',
+                'code': 4000
+            }))
 
     async def chat_message(self, event):
         await self.send(text_data=json.dumps({
+            'type': 'chat_message',
             'message': event['message'],
             'user': event['user'],
-            'picture': event['picture'],
+            'timestamp': event['timestamp'],
+            'image_url': event['image_url'],
         }))
 
     async def user_status(self, event):
         await self.send(text_data=json.dumps({
             'type': 'status',
-            'username': event['username'],
             'status': event['status'],
-            'picture': event['picture'],
-            'location': event['location'],
+            'user': event['user'],
+            'image_url': event['image_url'],
         }))
 
+    async def _reject(self, message, code):
+        await self.send(text_data=json.dumps({
+            'error': message,
+            'code': code
+        }))
+        await self.close(code=code)
+
     @database_sync_to_async
-    def save_message(self, user, content, room):
-        Message.objects.create(user=user, content=content, room=room)
+    def get_user_from_token(self, token_key):
+        try:
+            from rest_framework.authtoken.models import Token
+            return Token.objects.select_related('user').get(key=token_key).user
+        except Token.DoesNotExist:
+            return None
+
+    @database_sync_to_async
+    def get_profile(self, user):
+        try:
+            from .models import Profile
+            return Profile.objects.get(user=user)
+        except Exception:
+            return None
+
+    @database_sync_to_async
+    def get_user(self, username):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        try:
+            return User.objects.get(username=username)
+        except User.DoesNotExist:
+            return None
+
+    @database_sync_to_async
+    def create_message(self, sender, receiver_username, content):
+        from .models import Message
+        return Message.objects.create(
+            sender=sender,
+            receiver_username=receiver_username,
+            content=content
+        )
+
+    @database_sync_to_async
+    def get_previous_messages(self, user, friend_username, limit=50):
+        from .models import Message
+        try:
+            return list(
+                Message.objects.filter(
+                    (models.Q(sender=user) & models.Q(receiver_username=friend_username)) |
+                    (models.Q(sender__username=friend_username) & models.Q(receiver_username=user.username))
+                )
+                .order_by('timestamp')[:limit]
+                .values(
+                    'sender__username',
+                    'receiver_username',
+                    'content',
+                    'timestamp',
+                    'sender__profile__picture',
+                )
+            )
+        except Exception as e:
+            logger.error(f"Database error fetching messages: {str(e)}")
+            return []
+
+    async def _send_previous_messages(self, friend_username):
+        """Fetch and send previous messages between user and friend."""
+        try:
+            messages = await self.get_previous_messages(self.user, friend_username)
+            formatted_messages = []
+            for msg in messages:
+                formatted_messages.append({
+                    'type': 'chat_message',
+                    'message': msg['content'],
+                    'user': msg['sender__username'],
+                    'timestamp': str(msg['timestamp']),
+                    'image_url': (
+                        f"{settings.WEBSOCKET_BASE_URL}{msg['sender__profile__picture']}"
+                        if msg.get('sender__profile__picture') else ''
+                    )
+                })
+
+            await self.send(text_data=json.dumps({
+                'type': 'previous_messages',
+                'messages': formatted_messages
+            }))
+        except Exception as e:
+            logger.error(f"Error sending previous messages: {str(e)}", exc_info=True)
+            await self.send(text_data=json.dumps({
+                'error': f'Failed to load previous messages: {str(e)}',
+                'code': 4007
+            }))

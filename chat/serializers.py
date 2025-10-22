@@ -1,8 +1,9 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Profile, Friend
-from knox.models import AuthToken
+from .models import Profile, Friend, Message
+from rest_framework.authtoken.models import Token
 import redis
+from django.conf import settings
 
 redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0)
 
@@ -11,22 +12,59 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'username', 'email']
 
+class UserListSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+    location = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ['username', 'email', 'image_url', 'location']
+
+    def get_image_url(self, obj):
+        try:
+            profile = Profile.objects.get(user=obj)
+            return f"http://10.0.2.2:8000{settings.MEDIA_URL}{profile.picture.url}" if profile.picture else ''
+        except Profile.DoesNotExist:
+            return ''
+
+    def get_location(self, obj):
+        try:
+            profile = Profile.objects.get(user=obj)
+            return profile.location or ''
+        except Profile.DoesNotExist:
+            return ''
+
 class ProfileSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Profile
-        fields = ['picture', 'location']
+        fields = ['picture', 'location', 'image_url']
+
+    def get_image_url(self, obj):
+        if obj.picture and hasattr(obj.picture, 'url'):
+            return f"http://10.0.2.2:8000{settings.MEDIA_URL}{obj.picture.url}"
+        return ''
 
 class GetProfileSerializer(serializers.ModelSerializer):
-    username = serializers.CharField(source='user.username')
-    email = serializers.EmailField(source='user.email')
+    username = serializers.CharField(source='user.username', read_only=True)
+    email = serializers.CharField(source='user.email', read_only=True)
+    image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Profile
-        fields = ['username', 'email', 'picture', 'location']
+        fields = ['username', 'email', 'location', 'image_url']
+
+    def get_image_url(self, obj):
+        if obj.picture:
+            request = self.context.get('request')
+            return request.build_absolute_uri(obj.picture.url)
+        return None
 
 class PutProfileSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source='user.username', required=False)
     email = serializers.EmailField(source='user.email', required=False)
+    picture = serializers.ImageField(required=False)
 
     class Meta:
         model = Profile
@@ -71,26 +109,41 @@ class FriendSerializer(serializers.ModelSerializer):
     def get_friend_picture(self, obj):
         try:
             profile = Profile.objects.get(user=obj.friend)
-            return profile.picture.url if profile.picture else ''
+            return f"http://10.0.2.2:8000{settings.MEDIA_URL}{profile.picture.url}" if profile.picture else ''
         except Profile.DoesNotExist:
             return ''
 
     def get_friend_location(self, obj):
         try:
             profile = Profile.objects.get(user=obj.friend)
-            return profile.location
+            return profile.location or ''
         except Profile.DoesNotExist:
             return ''
 
     def get_is_active(self, obj):
-        return redis_client.exists(f'user:{obj.friend.username}:active')
+        return bool(redis_client.exists(f'user:{obj.friend.username}:active'))
+
+class MessageSerializer(serializers.ModelSerializer):
+    sender_username = serializers.CharField(source='sender.username')
+    receiver_username = serializers.CharField()
+    content = serializers.CharField()
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Message
+        fields = ['sender_username', 'receiver_username', 'content', 'timestamp', 'image_url']
+
+    def get_image_url(self, obj):
+        if obj.sender.profile_picture:
+            return self.context['request'].build_absolute_uri(obj.sender.profile_picture.url)
+        return ''
 
 class RegisterSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
     picture = serializers.ImageField(required=False)
-    location = serializers.CharField(max_length=100, required=False)
+    location = serializers.CharField(max_length=100, required=False, allow_blank=True)
 
     def validate_email(self, value):
         if User.objects.filter(email=value).exists():
@@ -113,8 +166,8 @@ class RegisterSerializer(serializers.Serializer):
             picture=validated_data.get('picture'),
             location=validated_data.get('location', '')
         )
-        token = AuthToken.objects.create(user)[1]
-        return user, token
+        token = Token.objects.create(user=user)
+        return user, token.key
 
 class LoginSerializer(serializers.Serializer):
     email = serializers.EmailField()
@@ -125,3 +178,5 @@ class LoginSerializer(serializers.Serializer):
         if user and user.check_password(data['password']):
             return user
         raise serializers.ValidationError("Invalid credentials")
+    
+    
