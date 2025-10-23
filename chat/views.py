@@ -1,199 +1,245 @@
-from django.contrib.auth import authenticate, login
-from rest_framework.views import APIView
+from rest_framework import generics, status
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.views import APIView
 from rest_framework.authtoken.models import Token
+from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
-from django.db import models
-from .models import Profile, Friend, FriendRequest, Message
-from .serializers import UserSerializer, MessageSerializer, GetProfileSerializer, PutProfileSerializer, FriendSerializer
+from django.contrib.auth import authenticate
+from django.db.models import Q
+from .models import Profile, Friend, Message, FriendRequest
+from .serializers import (
+    UserSerializer, UserListSerializer, ProfileSerializer, GetProfileSerializer,
+    PutProfileSerializer, FriendSerializer, MessageSerializer, RegisterSerializer,
+    LoginSerializer, FriendRequestSerializer, FriendRequestActionSerializer
+)
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # For debugging
 
-class LoginView(APIView):
+class RegisterView(generics.CreateAPIView):
+    """
+    POST: Register a new user.
+    """
+    queryset = User.objects.all()
+    serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
 
-    def post(self, request):
-        username = request.data.get('username')
-        password = request.data.get('password')
-        logger.debug(f"Login attempt for username: {username}")
-        if not username or not password:
-            logger.warning("Missing username or password")
-            return Response({'error': 'Username and password are required'}, status=status.HTTP_400_BAD_REQUEST)
-        user = authenticate(username=username, password=password)
-        if user:
-            login(request, user)
-            token, created = Token.objects.get_or_create(user=user)
-            logger.info(f"Login successful for {username}, token: {token.key}")
-            return Response({'token': token.key, 'username': user.username}, status=status.HTTP_200_OK)
-        logger.warning(f"Invalid credentials for username: {username}")
-        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
-
-class RegisterView(APIView):
-    permission_classes = [AllowAny]
-
-    def post(self, request):
-        serializer = UserSerializer(data=request.data)
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
         if serializer.is_valid():
-            user = serializer.save()
-            Profile.objects.create(user=user)
-            token, created = Token.objects.get_or_create(user=user)
-            logger.info(f"User registered: {user.username}, token: {token.key}")
-            return Response({'token': token.key, 'username': user.username}, status=status.HTTP_201_CREATED)
-        logger.warning(f"Registration failed: {serializer.errors}")
+            user, token_key = serializer.save()
+            return Response({
+                'user': UserSerializer(user).data,
+                'token': token_key
+            }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class UserListView(APIView):
+class LoginView(APIView):
+    """
+    POST: Login a user by email/password, return token.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.validated_data
+            token, created = Token.objects.get_or_create(user=user)
+            return Response({
+                'user': UserSerializer(user).data,
+                'token': token.key
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserListView(generics.ListAPIView):
+    """
+    GET: List all users (for friend search).
+    Query param: ?search=<query> to filter by username (case-insensitive partial match).
+    """
+    queryset = User.objects.all()
+    serializer_class = UserListSerializer
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        try:
-            users = User.objects.exclude(id=request.user.id).select_related('profile')
-            serializer = UserSerializer(users, many=True)
-            logger.info(f"User list fetched by {request.user.username}")
-            return Response(serializer.data)
-        except Exception as e:
-            logger.error(f"Error fetching user list: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        search_query = self.request.query_params.get('search', None)
+        if search_query:
+            queryset = queryset.filter(Q(username__icontains=search_query) | Q(first_name__icontains=search_query) | Q(last_name__icontains=search_query) | Q(email__icontains=search_query))
+        # Optionally exclude self
+        return queryset.exclude(id=self.request.user.id).distinct()
 
 class AddFriendView(APIView):
+    """
+    POST: Send a friend request to another user by username.
+    Expects: {"to_username": "target_username"}
+    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        friend_username = request.data.get('friend_username')
+        to_username = request.data.get('to_username')
+        if not to_username:
+            return Response({"error": "to_username is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
         try:
-            friend = User.objects.get(username=friend_username)
-            if friend == request.user:
-                logger.warning(f"{request.user.username} attempted to add self as friend")
-                return Response({'error': 'Cannot add yourself as a friend'}, status=status.HTTP_400_BAD_REQUEST)
-            if Friend.objects.filter(user=request.user, friend=friend).exists():
-                logger.warning(f"{request.user.username} already friends with {friend_username}")
-                return Response({'error': 'Already friends'}, status=status.HTTP_400_BAD_REQUEST)
-            if FriendRequest.objects.filter(from_user=request.user, to_user=friend, status='pending').exists():
-                logger.warning(f"Friend request already sent to {friend_username}")
-                return Response({'error': 'Friend request already sent'}, status=status.HTTP_400_BAD_REQUEST)
-            FriendRequest.objects.create(from_user=request.user, to_user=friend, status='pending')
-            logger.info(f"Friend request sent from {request.user.username} to {friend_username}")
-            return Response({'message': 'Friend request sent'}, status=status.HTTP_201_CREATED)
+            to_user = User.objects.get(username=to_username)
         except User.DoesNotExist:
-            logger.warning(f"Friend not found: {friend_username}")
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error sending friend request: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        from_user = request.user
+        
+        # Check if already friends
+        if Friend.objects.filter(user=from_user, friend=to_user).exists():
+            return Response({"error": "Already friends"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if request already exists
+        if FriendRequest.objects.filter(from_user=from_user, to_user=to_user).exists():
+            return Response({"error": "Friend request already sent"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Create pending request
+        friend_request = FriendRequest.objects.create(
+            from_user=from_user,
+            to_user=to_user,
+            status='pending'
+        )
+        
+        serializer = FriendRequestSerializer(friend_request)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-class MessageListView(APIView):
+class MessageListView(generics.ListCreateAPIView):
+    """
+    GET: List messages with a friend.
+    POST: Send a new message.
+    """
+    serializer_class = MessageSerializer
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, friend_username):
-        try:
-            messages = Message.objects.filter(
-                (models.Q(sender=request.user) & models.Q(receiver_username=friend_username)) |
-                (models.Q(sender__username=friend_username) & models.Q(receiver_username=request.user.username))
-            ).order_by('timestamp').select_related('sender__profile')
-            serializer = MessageSerializer(messages, many=True)
-            logger.info(f"Messages fetched for {request.user.username} with {friend_username}")
-            return Response(serializer.data)
-        except Exception as e:
-            logger.error(f"Error fetching messages: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    def get_queryset(self):
+        friend_username = self.kwargs['friend_username']
+        return Message.objects.filter(
+            sender=self.request.user,
+            receiver_username=friend_username
+        ) | Message.objects.filter(
+            sender__username=friend_username,
+            receiver_username=self.request.user.username
+        ).order_by('timestamp')
 
-class GetProfileView(APIView):
+    def perform_create(self, serializer):
+        friend_username = self.kwargs['friend_username']
+        serializer.save(sender=self.request.user, receiver_username=friend_username)
+
+class GetProfileView(generics.RetrieveAPIView):
+    """
+    GET: Get current user's profile.
+    """
+    serializer_class = GetProfileSerializer
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        try:
-            profile = Profile.objects.get(user=request.user)
-            serializer = GetProfileSerializer(profile, context={'request': request})
-            logger.info(f"Profile fetched for {request.user.username}")
-            return Response(serializer.data, status=status.HTTP_200_OK)
-        except Profile.DoesNotExist:
-            logger.warning(f"Profile not found for {request.user.username}")
-            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error fetching profile: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    def get_object(self):
+        profile, created = Profile.objects.get_or_create(user=self.request.user)
+        return profile
 
-class PutProfileView(APIView):
+class PutProfileView(generics.UpdateAPIView):
+    """
+    PUT/PATCH: Update current user's profile.
+    """
+    serializer_class = PutProfileSerializer
     permission_classes = [IsAuthenticated]
 
-    def put(self, request):
-        try:
-            profile = Profile.objects.get(user=request.user)
-            serializer = PutProfileSerializer(profile, data=request.data, context={'request': request})
-            if serializer.is_valid():
-                serializer.save()
-                logger.info(f"Profile updated for {request.user.username}")
-                return Response(serializer.data, status=status.HTTP_200_OK)
-            logger.warning(f"Profile update failed for {request.user.username}: {serializer.errors}")
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        except Profile.DoesNotExist:
-            logger.warning(f"Profile not found for {request.user.username}")
-            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error updating profile: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    def get_object(self):
+        profile, created = Profile.objects.get_or_create(user=self.request.user)
+        return profile
+
+    def patch(self, request, *args, **kwargs):
+        return self.partial_update(request, *args, **kwargs)
+
+class ListFriendRequestsView(generics.ListAPIView):
+    """
+    GET: List received or sent friend requests for the current user.
+    Query params: ?type=received (default) or ?type=sent
+    """
+    serializer_class = FriendRequestSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        request_type = self.request.query_params.get('type', 'received')
+        
+        if request_type == 'received':
+            return FriendRequest.objects.filter(to_user=user, status='pending')
+        elif request_type == 'sent':
+            return FriendRequest.objects.filter(from_user=user)
+        else:
+            return FriendRequest.objects.none()  # Invalid type
 
 class FriendRequestView(APIView):
+    """
+    POST/PATCH: Accept or reject a friend request by ID.
+    Expects: {"request_id": 1, "status": "accepted"} or {"status": "rejected"}
+    Supports both POST and PATCH.
+    """
     permission_classes = [IsAuthenticated]
 
-    def post(self, request):
-        try:
-            friend_request_id = request.data.get('friend_request_id')
-            action = request.data.get('action')  # 'accept' or 'reject'
-            friend_request = FriendRequest.objects.get(id=friend_request_id, to_user=request.user)
-            if action == 'accept':
-                Friend.objects.get_or_create(user=request.user, friend=friend_request.from_user)
-                Friend.objects.get_or_create(user=friend_request.from_user, friend=request.user)
-                friend_request.status = 'accepted'
-                friend_request.save()
-                logger.info(f"Friend request accepted by {request.user.username} from {friend_request.from_user.username}")
-                return Response({'message': 'Friend request accepted'}, status=status.HTTP_200_OK)
-            elif action == 'reject':
-                friend_request.status = 'rejected'
-                friend_request.save()
-                logger.info(f"Friend request rejected by {request.user.username} from {friend_request.from_user.username}")
-                return Response({'message': 'Friend request rejected'}, status=status.HTTP_200_OK)
-            else:
-                logger.warning(f"Invalid action {action} for friend request {friend_request_id}")
-                return Response({'error': 'Invalid action'}, status=status.HTTP_400_BAD_REQUEST)
-        except FriendRequest.DoesNotExist:
-            logger.warning(f"Friend request {friend_request_id} not found for {request.user.username}")
-            return Response({'error': 'Friend request not found'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error processing friend request: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    def post(self, request, *args, **kwargs):
+        return self._handle_action(request, *args, **kwargs)
 
-class ListFriendsView(APIView):
+    def patch(self, request, *args, **kwargs):  # Added for PATCH support
+        return self._handle_action(request, *args, **kwargs)
+
+    def _handle_action(self, request, *args, **kwargs):
+        request_id = request.data.get('request_id')
+        if not request_id:
+            return Response({"error": "request_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            request_id = int(request_id)  # Ensure int, handle conversion error
+        except (ValueError, TypeError):
+            return Response({"error": "Invalid request_id format (must be integer)"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        friend_request = get_object_or_404(FriendRequest, id=request_id, to_user=request.user)
+        
+        if friend_request.status != 'pending':
+            return Response({"error": "Can only act on pending requests"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        logger.debug(f"Processing request {request_id} with status {request.data.get('status')}")  # Debug log
+        
+        serializer = FriendRequestActionSerializer(data=request.data)
+        if serializer.is_valid():
+            status = serializer.validated_data['status']
+            
+            logger.debug(f"Valid status: {status}")  # Debug
+            
+            if status == 'accepted':
+                logger.debug("Creating friend records")  # Debug
+                Friend.objects.get_or_create(user=friend_request.to_user, friend=friend_request.from_user)
+                Friend.objects.get_or_create(user=friend_request.from_user, friend=friend_request.to_user)
+            
+            friend_request.status = status
+            friend_request.save()
+            logger.debug("Saved request status")  # Debug
+            
+            try:
+                # Try to serialize full data
+                updated_serializer = FriendRequestSerializer(friend_request)
+                logger.debug(f"Serialized data: {updated_serializer.data}")  # Debug
+                return Response(updated_serializer.data, status=status.HTTP_200_OK)
+            except Exception as e:
+                # Fallback if serialization fails (e.g., AttributeError)
+                logger.error(f"Serialization error: {e}")
+                return Response({
+                    "success": True,
+                    "id": friend_request.id,
+                    "status": friend_request.status,
+                    "message": f"Request {status} successfully"
+                }, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ListFriendsView(generics.ListAPIView):
+    """
+    GET: List current user's friends.
+    """
+    serializer_class = FriendSerializer
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        try:
-            friends = Friend.objects.filter(user=request.user).select_related('friend__profile')
-            serializer = FriendSerializer(friends, many=True)
-            logger.info(f"Friends listed for {request.user.username}")
-            return Response(serializer.data, status=status.HTTP_200_OK)
-        except Exception as e:
-            logger.error(f"Error listing friends: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-class ListFriendRequestsView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        try:
-            friend_requests = FriendRequest.objects.filter(to_user=request.user, status='pending').select_related('from_user')
-            data = [
-                {
-                    'id': fr.id,
-                    'from_username': fr.from_user.username,
-                    'created_at': fr.created_at
-                } for fr in friend_requests
-            ]
-            logger.info(f"Friend requests listed for {request.user.username}")
-            return Response(data, status=status.HTTP_200_OK)
-        except Exception as e:
-            logger.error(f"Error listing friend requests: {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_424_FAILED_DEPENDENCY)
+    def get_queryset(self):
+        return Friend.objects.filter(user=self.request.user)

@@ -1,9 +1,10 @@
+# chat/models.py
 from django.db import models
 from django.contrib.auth.models import User
 
 class Profile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE)
-    email = models.EmailField(default='default@example.com')  # Set a default
+    email = models.EmailField(default='default@example.com')
     location = models.CharField(max_length=100, blank=True)
     picture = models.ImageField(upload_to='profiles/', blank=True, null=True)
 
@@ -28,8 +29,8 @@ class FriendRequest(models.Model):
         unique_together = ('from_user', 'to_user')
 
 class Message(models.Model):
-    sender = models.ForeignKey(User, related_name='sent_messages', on_delete=models.CASCADE, null=True, blank=True)  # Temporary nullable
-    receiver_username = models.CharField(max_length=150, null=True, blank=True)  # Already nullable from previous fix
+    sender = models.ForeignKey(User, related_name='sent_messages', on_delete=models.CASCADE, null=True, blank=True)
+    receiver_username = models.CharField(max_length=150, null=True, blank=True)
     content = models.TextField()
     timestamp = models.DateTimeField(auto_now_add=True)
 

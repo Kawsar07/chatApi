@@ -1,3 +1,4 @@
+# chat/consumers.py
 import json
 import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
@@ -8,10 +9,8 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Extract token and friend_username from query string
         query_string = self.scope.get('query_string', b'').decode()
         params = dict(param.split('=') for param in query_string.split('&') if '=' in param)
         token = params.get('token')
@@ -24,9 +23,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            from django.contrib.auth import get_user_model
-            from rest_framework.authtoken.models import Token
-
             user = await self.get_user_from_token(token)
             if not user or not user.is_authenticated:
                 logger.error(f"Invalid or unauthenticated user for token: {token}")
@@ -38,20 +34,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
             self.friend_username = friend_username
             logger.info(f"User authenticated: {user.username}, friend={friend_username}")
 
-            # Join room group
             await self.channel_layer.group_add(self.room_group_name, self.channel_name)
             await self.accept()
             logger.info(f"WebSocket connection accepted for user: {user.username}")
 
-            # Get profile and image URL
-            from .models import Profile
             profile = await self.get_profile(user)
             image_url = (
-                f"{settings.WEBSOCKET_BASE_URL}{profile.picture.url}"
+                f"{settings.WEBSOCKET_BASE_URL.rstrip('/')}{profile.picture.url}"
                 if profile and profile.picture else ''
             )
+            logger.debug(f"Connection image_url: {image_url}")
 
-            # Broadcast join status
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
@@ -62,7 +55,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 }
             )
 
-            # Send connection confirmation
             await self.send(text_data=json.dumps({
                 'type': 'status',
                 'status': 'connected',
@@ -71,9 +63,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 'image_url': image_url,
             }))
 
-            # Send previous messages if friend_username is provided
             if friend_username:
-                await self._send_previous_messages(friend_username)
+                messages = await self.get_previous_messages(user, friend_username)
+                await self.send(text_data=json.dumps({
+                    'type': 'previous_messages',
+                    'messages': messages
+                }))
             else:
                 logger.debug("No friend_username provided; skipping previous messages")
 
@@ -85,12 +80,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
         logger.debug(f"WebSocket disconnect: user={getattr(self, 'user', None)}, code={close_code}")
         if hasattr(self, 'user') and self.user.is_authenticated:
             try:
-                from .models import Profile
                 profile = await self.get_profile(self.user)
                 image_url = (
-                    f"{settings.WEBSOCKET_BASE_URL}{profile.picture.url}"
+                    f"{settings.WEBSOCKET_BASE_URL.rstrip('/')}{profile.picture.url}"
                     if profile and profile.picture else ''
                 )
+                logger.debug(f"Disconnect image_url: {image_url}")
                 await self.channel_layer.group_send(
                     self.room_group_name,
                     {
@@ -119,11 +114,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 }))
                 return
 
-            # Update friend_username if not set
             if not hasattr(self, 'friend_username') or not self.friend_username:
                 self.friend_username = receiver_username
 
-            # Verify receiver exists
             receiver = await self.get_user(receiver_username)
             if not receiver:
                 await self.send(text_data=json.dumps({
@@ -132,25 +125,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 }))
                 return
 
-            # Save message
             try:
                 message_obj = await self.create_message(self.user, receiver_username, message)
             except Exception as e:
+                logger.error(f"Failed to save message: {str(e)}")
                 await self.send(text_data=json.dumps({
                     'error': f'Failed to save message: {str(e)}',
                     'code': 4006
                 }))
                 return
 
-            # Get sender's profile image
-            from .models import Profile
             profile = await self.get_profile(self.user)
             image_url = (
-                f"{settings.WEBSOCKET_BASE_URL}{profile.picture.url}"
+                f"{settings.WEBSOCKET_BASE_URL.rstrip('/')}{profile.picture.url}"
                 if profile and profile.picture else ''
             )
+            logger.debug(f"Message image_url: {image_url}")
 
-            # Broadcast message
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
@@ -162,10 +153,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 }
             )
 
-            # Send previous messages once
             if not getattr(self, '_history_sent', False):
                 self._history_sent = True
-                await self._send_previous_messages(receiver_username)
+                messages = await self.get_previous_messages(self.user, receiver_username)
+                await self.send(text_data=json.dumps({
+                    'type': 'previous_messages',
+                    'messages': messages
+                }))
 
         except json.JSONDecodeError:
             await self.send(text_data=json.dumps({
@@ -205,18 +199,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def get_user_from_token(self, token_key):
+        from rest_framework.authtoken.models import Token
         try:
-            from rest_framework.authtoken.models import Token
             return Token.objects.select_related('user').get(key=token_key).user
         except Token.DoesNotExist:
+            logger.warning(f"Token not found: {token_key}")
             return None
 
     @database_sync_to_async
     def get_profile(self, user):
+        from .models import Profile
         try:
-            from .models import Profile
             return Profile.objects.get(user=user)
-        except Exception:
+        except Profile.DoesNotExist:
+            logger.warning(f"Profile not found for user {user.username}")
             return None
 
     @database_sync_to_async
@@ -226,6 +222,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         try:
             return User.objects.get(username=username)
         except User.DoesNotExist:
+            logger.warning(f"User not found: {username}")
             return None
 
     @database_sync_to_async
@@ -240,49 +237,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def get_previous_messages(self, user, friend_username, limit=50):
         from .models import Message
+        from .serializers import MessageSerializer
         try:
-            return list(
-                Message.objects.filter(
-                    (models.Q(sender=user) & models.Q(receiver_username=friend_username)) |
-                    (models.Q(sender__username=friend_username) & models.Q(receiver_username=user.username))
-                )
-                .order_by('timestamp')[:limit]
-                .values(
-                    'sender__username',
-                    'receiver_username',
-                    'content',
-                    'timestamp',
-                    'sender__profile__picture',
-                )
-            )
+            messages = Message.objects.filter(
+                (models.Q(sender=user) & models.Q(receiver_username=friend_username)) |
+                (models.Q(sender__username=friend_username) & models.Q(receiver_username=user.username))
+            ).order_by('timestamp')[:limit]
+            serializer = MessageSerializer(messages, many=True, context={'request': None})
+            return serializer.data
         except Exception as e:
             logger.error(f"Database error fetching messages: {str(e)}")
             return []
-
-    async def _send_previous_messages(self, friend_username):
-        """Fetch and send previous messages between user and friend."""
-        try:
-            messages = await self.get_previous_messages(self.user, friend_username)
-            formatted_messages = []
-            for msg in messages:
-                formatted_messages.append({
-                    'type': 'chat_message',
-                    'message': msg['content'],
-                    'user': msg['sender__username'],
-                    'timestamp': str(msg['timestamp']),
-                    'image_url': (
-                        f"{settings.WEBSOCKET_BASE_URL}{msg['sender__profile__picture']}"
-                        if msg.get('sender__profile__picture') else ''
-                    )
-                })
-
-            await self.send(text_data=json.dumps({
-                'type': 'previous_messages',
-                'messages': formatted_messages
-            }))
-        except Exception as e:
-            logger.error(f"Error sending previous messages: {str(e)}", exc_info=True)
-            await self.send(text_data=json.dumps({
-                'error': f'Failed to load previous messages: {str(e)}',
-                'code': 4007
-            }))
