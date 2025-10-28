@@ -10,7 +10,7 @@ from .serializers import (
     RegisterSerializer, LoginSerializer, UserListSerializer,
     FriendSerializer, FriendRequestSerializer, FriendRequestActionSerializer,
     MessageSerializer, MessageCountSerializer, GetProfileSerializer, PutProfileSerializer,
-    FriendCountSerializer, GlobalMessageCountSerializer  # <-- NEW
+    FriendCountSerializer, GlobalMessageCountSerializer 
 )
 import logging
 

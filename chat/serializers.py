@@ -6,8 +6,6 @@ from .models import Profile, Friend, Message, FriendRequest
 import logging
 
 logger = logging.getLogger(__name__)
-
-# === EXISTING SERIALIZERS (unchanged) ===
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -132,18 +130,15 @@ class RegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         logger.debug(f"Registering user with data: {validated_data}")
 
-        # Extract profile fields
         location = validated_data.pop('location', '')
         picture = validated_data.pop('picture', None)
 
-        # Create User
         user = User.objects.create_user(
             username=validated_data['username'],
             email=validated_data['email'],
             password=validated_data['password']
         )
 
-        # Create or update Profile
         profile, created = Profile.objects.get_or_create(user=user)
         profile.location = location
         if picture:
@@ -226,8 +221,6 @@ class FriendRequestActionSerializer(serializers.Serializer):
     request_id = serializers.IntegerField()
     status = serializers.ChoiceField(choices=['accepted', 'rejected'])
 
-
-# === NEW SERIALIZERS ADDED BELOW ===
 
 class FriendCountSerializer(serializers.Serializer):
     count = serializers.IntegerField(read_only=True)

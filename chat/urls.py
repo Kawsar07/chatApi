@@ -15,8 +15,6 @@ urlpatterns = [
     path('api/friend-request/action/', views.FriendRequestActionView.as_view(), name='friend-request-action'),
     path('api/friends/', views.ListFriendsView.as_view(), name='list-friends'),
     path('api/messages/count/', views.MessageCountView.as_view(), name='message-count'),
-
-    # === NEW ENDPOINTS ===
     path('api/friend-count/', views.FriendCountView.as_view(), name='friend-count'),
     path('api/message-count/', views.GlobalMessageCountView.as_view(), name='global-message-count'),
 
