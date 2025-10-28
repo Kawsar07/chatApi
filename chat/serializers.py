@@ -1,245 +1,237 @@
-from rest_framework import generics, status
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework.authtoken.models import Token
-from django.shortcuts import get_object_or_404
+from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
-from django.db.models import Q
+from rest_framework.authtoken.models import Token
 from .models import Profile, Friend, Message, FriendRequest
-from .serializers import (
-    UserSerializer, UserListSerializer, ProfileSerializer, GetProfileSerializer,
-    PutProfileSerializer, FriendSerializer, MessageSerializer, RegisterSerializer,
-    LoginSerializer, FriendRequestSerializer, FriendRequestActionSerializer
-)
 import logging
 
-logger = logging.getLogger(__name__)  # For debugging
+logger = logging.getLogger(__name__)
 
-class RegisterView(generics.CreateAPIView):
-    """
-    POST: Register a new user.
-    """
-    queryset = User.objects.all()
-    serializer_class = RegisterSerializer
-    permission_classes = [AllowAny]
+# === EXISTING SERIALIZERS (unchanged) ===
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'email', 'first_name', 'last_name']
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            user, token_key = serializer.save()
-            return Response({
-                'user': UserSerializer(user).data,
-                'token': token_key
-            }, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+class UserListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'username']
 
-class LoginView(APIView):
-    """
-    POST: Login a user by email/password, return token.
-    """
-    permission_classes = [AllowAny]
+class ProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Profile
+        fields = ['user', 'email', 'location', 'picture']
 
-    def post(self, request):
-        serializer = LoginSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.validated_data
-            token, created = Token.objects.get_or_create(user=user)
-            return Response({
-                'user': UserSerializer(user).data,
-                'token': token.key
-            })
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+class GetProfileSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source='user.username', read_only=True)
+    email    = serializers.EmailField(source='user.email', read_only=True)
+    location = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    picture  = serializers.SerializerMethodField()
 
-class UserListView(generics.ListAPIView):
-    """
-    GET: List all users (for friend search).
-    Query param: ?search=<query> to filter by username (case-insensitive partial match).
-    """
-    queryset = User.objects.all()
-    serializer_class = UserListSerializer
-    permission_classes = [IsAuthenticated]
+    class Meta:
+        model = Profile
+        fields = ['username', 'email', 'location', 'picture']
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        search_query = self.request.query_params.get('search', None)
-        if search_query:
-            queryset = queryset.filter(Q(username__icontains=search_query) | Q(first_name__icontains=search_query) | Q(last_name__icontains=search_query) | Q(email__icontains=search_query))
-        # Optionally exclude self
-        return queryset.exclude(id=self.request.user.id).distinct()
+    def get_picture(self, obj):
+        if not obj.picture:
+            return None
+        request = self.context.get('request')
+        picture_url = obj.picture.url if hasattr(obj.picture, 'url') else str(obj.picture)
+        if request:
+            return request.build_absolute_uri(picture_url)
+        return picture_url
 
-class AddFriendView(APIView):
-    """
-    POST: Send a friend request to another user by username.
-    Expects: {"to_username": "target_username"}
-    """
-    permission_classes = [IsAuthenticated]
+class PutProfileSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
 
-    def post(self, request):
-        to_username = request.data.get('to_username')
-        if not to_username:
-            return Response({"error": "to_username is required"}, status=status.HTTP_400_BAD_REQUEST)
-        
+    class Meta:
+        model = Profile
+        fields = ['email', 'location', 'picture']
+
+    def validate_email(self, value):
+        if value and not value.strip():
+            raise serializers.ValidationError("Email cannot be empty")
+        return value
+
+    def update(self, instance, validated_data):
+        instance.email = validated_data.get('email', instance.email)
+        instance.location = validated_data.get('location', instance.location)
+        if 'picture' in validated_data:
+            instance.picture = validated_data['picture']
+        instance.save()
+
+        if 'email' in validated_data:
+            instance.user.email = validated_data['email']
+            instance.user.save()
+
+        return instance
+
+class FriendSerializer(serializers.ModelSerializer):
+    friend_username = serializers.CharField(source='friend.username', read_only=True)
+    friend_picture = serializers.SerializerMethodField()
+    friend_location = serializers.CharField(source='friend.profile.location', read_only=True, allow_null=True)
+
+    class Meta:
+        model = Friend
+        fields = ['user', 'friend', 'friend_username', 'friend_picture', 'friend_location', 'created_at']
+
+    def get_friend_picture(self, obj):
         try:
-            to_user = User.objects.get(username=to_username)
-        except User.DoesNotExist:
-            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
-        
-        from_user = request.user
-        
-        # Check if already friends
-        if Friend.objects.filter(user=from_user, friend=to_user).exists():
-            return Response({"error": "Already friends"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Check if request already exists
-        if FriendRequest.objects.filter(from_user=from_user, to_user=to_user).exists():
-            return Response({"error": "Friend request already sent"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Create pending request
-        friend_request = FriendRequest.objects.create(
-            from_user=from_user,
-            to_user=to_user,
-            status='pending'
+            if obj.friend.profile.picture:
+                request = self.context.get('request')
+                picture_url = obj.friend.profile.picture.url if hasattr(obj.friend.profile.picture, 'url') else obj.friend.profile.picture
+                return request.build_absolute_uri(picture_url) if request else picture_url
+            return None
+        except Profile.DoesNotExist:
+            return None
+
+class MessageSerializer(serializers.ModelSerializer):
+    sender_picture = serializers.SerializerMethodField()
+    receiver_picture = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Message
+        fields = ['sender', 'receiver_username', 'content', 'timestamp', 'sender_picture', 'receiver_picture']
+
+    def get_sender_picture(self, obj):
+        try:
+            if obj.sender.profile.picture:
+                request = self.context.get('request')
+                picture_url = obj.sender.profile.picture.url if hasattr(obj.sender.profile.picture, 'url') else obj.sender.profile.picture
+                return request.build_absolute_uri(picture_url) if request else picture_url
+            return None
+        except Profile.DoesNotExist:
+            return None
+
+    def get_receiver_picture(self, obj):
+        try:
+            receiver = User.objects.get(username=obj.receiver_username)
+            if receiver.profile.picture:
+                request = self.context.get('request')
+                picture_url = receiver.profile.picture.url if hasattr(receiver.profile.picture, 'url') else receiver.profile.picture
+                return request.build_absolute_uri(picture_url) if request else picture_url
+            return None
+        except (User.DoesNotExist, Profile.DoesNotExist):
+            return None
+
+class MessageCountSerializer(serializers.Serializer):
+    username = serializers.CharField()
+    count = serializers.IntegerField()
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, min_length=6)
+    location = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    picture = serializers.ImageField(required=False, allow_null=True)
+
+    class Meta:
+        model = User
+        fields = ['username', 'email', 'password', 'location', 'picture']
+
+    def create(self, validated_data):
+        logger.debug(f"Registering user with data: {validated_data}")
+
+        # Extract profile fields
+        location = validated_data.pop('location', '')
+        picture = validated_data.pop('picture', None)
+
+        # Create User
+        user = User.objects.create_user(
+            username=validated_data['username'],
+            email=validated_data['email'],
+            password=validated_data['password']
         )
-        
-        serializer = FriendRequestSerializer(friend_request)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-class MessageListView(generics.ListCreateAPIView):
-    """
-    GET: List messages with a friend.
-    POST: Send a new message.
-    """
-    serializer_class = MessageSerializer
-    permission_classes = [IsAuthenticated]
+        # Create or update Profile
+        profile, created = Profile.objects.get_or_create(user=user)
+        profile.location = location
+        if picture:
+            profile.picture = picture
+        profile.email = user.email  # sync
+        profile.save()
 
-    def get_queryset(self):
-        friend_username = self.kwargs['friend_username']
-        return Message.objects.filter(
-            sender=self.request.user,
-            receiver_username=friend_username
-        ) | Message.objects.filter(
-            sender__username=friend_username,
-            receiver_username=self.request.user.username
-        ).order_by('timestamp')
+        token, _ = Token.objects.get_or_create(user=user)
+        logger.debug(f"User registered: {user.username}, Token: {token.key}")
 
-    def perform_create(self, serializer):
-        friend_username = self.kwargs['friend_username']
-        serializer.save(sender=self.request.user, receiver_username=friend_username)
+        return user, token.key
 
-class GetProfileView(generics.RetrieveAPIView):
-    """
-    GET: Get current user's profile.
-    """
-    serializer_class = GetProfileSerializer
-    permission_classes = [IsAuthenticated]
+class LoginSerializer(serializers.Serializer):
+    username = serializers.CharField(required=False)
+    email = serializers.EmailField(required=False)
+    password = serializers.CharField()
 
-    def get_object(self):
-        profile, created = Profile.objects.get_or_create(user=self.request.user)
-        return profile
+    def validate(self, data):
+        logger.debug(f"Validating login with data: {data}")
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
 
-class PutProfileView(generics.UpdateAPIView):
-    """
-    PUT/PATCH: Update current user's profile.
-    """
-    serializer_class = PutProfileSerializer
-    permission_classes = [IsAuthenticated]
+        if not (username or email):
+            raise serializers.ValidationError("Either username or email is required")
 
-    def get_object(self):
-        profile, created = Profile.objects.get_or_create(user=self.request.user)
-        return profile
-
-    def patch(self, request, *args, **kwargs):
-        return self.partial_update(request, *args, **kwargs)
-
-class ListFriendRequestsView(generics.ListAPIView):
-    """
-    GET: List received or sent friend requests for the current user.
-    Query params: ?type=received (default) or ?type=sent
-    """
-    serializer_class = FriendRequestSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        request_type = self.request.query_params.get('type', 'received')
-        
-        if request_type == 'received':
-            return FriendRequest.objects.filter(to_user=user, status='pending')
-        elif request_type == 'sent':
-            return FriendRequest.objects.filter(from_user=user)
-        else:
-            return FriendRequest.objects.none()  # Invalid type
-
-class FriendRequestView(APIView):
-    """
-    POST/PATCH: Accept or reject a friend request by ID.
-    Expects: {"request_id": 1, "status": "accepted"} or {"status": "rejected"}
-    Supports both POST and PATCH.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request, *args, **kwargs):
-        return self._handle_action(request, *args, **kwargs)
-
-    def patch(self, request, *args, **kwargs):  # Added for PATCH support
-        return self._handle_action(request, *args, **kwargs)
-
-    def _handle_action(self, request, *args, **kwargs):
-        request_id = request.data.get('request_id')
-        if not request_id:
-            return Response({"error": "request_id is required"}, status=status.HTTP_400_BAD_REQUEST)
-        
         try:
-            request_id = int(request_id)  # Ensure int, handle conversion error
-        except (ValueError, TypeError):
-            return Response({"error": "Invalid request_id format (must be integer)"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        friend_request = get_object_or_404(FriendRequest, id=request_id, to_user=request.user)
-        
-        if friend_request.status != 'pending':
-            return Response({"error": "Can only act on pending requests"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        logger.debug(f"Processing request {request_id} with status {request.data.get('status')}")  # Debug log
-        
-        serializer = FriendRequestActionSerializer(data=request.data)
-        if serializer.is_valid():
-            status = serializer.validated_data['status']
-            
-            logger.debug(f"Valid status: {status}")  # Debug
-            
-            if status == 'accepted':
-                logger.debug("Creating friend records")  # Debug
-                Friend.objects.get_or_create(user=friend_request.to_user, friend=friend_request.from_user)
-                Friend.objects.get_or_create(user=friend_request.from_user, friend=friend_request.to_user)
-            
-            friend_request.status = status
-            friend_request.save()
-            logger.debug("Saved request status")  # Debug
-            
-            try:
-                # Try to serialize full data
-                updated_serializer = FriendRequestSerializer(friend_request)
-                logger.debug(f"Serialized data: {updated_serializer.data}")  # Debug
-                return Response(updated_serializer.data, status=status.HTTP_200_OK)
-            except Exception as e:
-                # Fallback if serialization fails (e.g., AttributeError)
-                logger.error(f"Serialization error: {e}")
-                return Response({
-                    "success": True,
-                    "id": friend_request.id,
-                    "status": friend_request.status,
-                    "message": f"Request {status} successfully"
-                }, status=status.HTTP_200_OK)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            if email:
+                user = User.objects.get(email=email)
+                username = user.username
+            else:
+                user = User.objects.get(username=username)
+            user = authenticate(username=username, password=password)
+            if user and user.is_active:
+                logger.debug(f"User authenticated: {user.username}")
+                return user
+            logger.error("Authentication failed: Incorrect credentials")
+            raise serializers.ValidationError("Incorrect credentials")
+        except User.DoesNotExist:
+            logger.error(f"User with {'email' if email else 'username'} {email or username} not found")
+            raise serializers.ValidationError("Incorrect credentials")
 
-class ListFriendsView(generics.ListAPIView):
-    """
-    GET: List current user's friends.
-    """
-    serializer_class = FriendSerializer
-    permission_classes = [IsAuthenticated]
+class FriendRequestSerializer(serializers.ModelSerializer):
+    from_username = serializers.CharField(source='from_user.username', read_only=True)
+    to_username = serializers.CharField(source='to_user.username', read_only=True)
+    from_email = serializers.CharField(source='from_user.email', read_only=True)
+    to_email = serializers.CharField(source='to_user.email', read_only=True)
+    from_picture = serializers.SerializerMethodField()
+    to_picture = serializers.SerializerMethodField()
 
-    def get_queryset(self):
-        return Friend.objects.filter(user=self.request.user)
+    class Meta:
+        model = FriendRequest
+        fields = [
+            'id', 'from_user', 'to_user', 'from_username', 'to_username',
+            'from_email', 'to_email', 'from_picture', 'to_picture',
+            'status', 'created_at'
+        ]
+
+    def get_from_picture(self, obj):
+        try:
+            if obj.from_user.profile.picture:
+                request = self.context.get('request')
+                picture_url = obj.from_user.profile.picture.url if hasattr(obj.from_user.profile.picture, 'url') else obj.from_user.profile.picture
+                return request.build_absolute_uri(picture_url) if request else picture_url
+            return None
+        except Profile.DoesNotExist:
+            return None
+
+    def get_to_picture(self, obj):
+        try:
+            if obj.to_user.profile.picture:
+                request = self.context.get('request')
+                picture_url = obj.to_user.profile.picture.url if hasattr(obj.to_user.profile.picture, 'url') else obj.to_user.profile.picture
+                return request.build_absolute_uri(picture_url) if request else picture_url
+            return None
+        except Profile.DoesNotExist:
+            return None
+
+class FriendRequestActionSerializer(serializers.Serializer):
+    request_id = serializers.IntegerField()
+    status = serializers.ChoiceField(choices=['accepted', 'rejected'])
+
+
+# === NEW SERIALIZERS ADDED BELOW ===
+
+class FriendCountSerializer(serializers.Serializer):
+    count = serializers.IntegerField(read_only=True)
+
+
+class GlobalMessageCountSerializer(serializers.Serializer):
+    count = serializers.IntegerField(read_only=True)
